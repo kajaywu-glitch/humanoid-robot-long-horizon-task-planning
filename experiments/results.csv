@@ -1,0 +1,2 @@
+experiment_id,date,commit,branch,task_id,seed,score,total_time_seconds,furthest_stage,correct_parts,wrong_parts,box_lifted,stable_placement,failure_reason,log_path,video_path
+
