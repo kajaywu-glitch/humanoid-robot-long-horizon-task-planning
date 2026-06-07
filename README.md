@@ -7,7 +7,7 @@
 - 已整理赛题目标、评分规则、提交约束和官方接口。
 - 已建立 `Owner -> Issue -> CC -> PR/Handoff -> Codex Review -> Simulation -> Merge` 协作闭环。
 - 已建立 `TaskSolver`、长时序 FSM、观测解析和合法 action 构造的离线基线。
-- 当前策略仅输出安全的中性动作，不具备仿真得分能力；后续控制策略必须在 Tongverse Docker 环境内逐阶段接入和验证。
+- 当前策略默认为安全中性模式 (`safe_mode=True`)，仅输出已验证的零向量动作；实验性步态、抓取和恢复控制在 `safe_mode=False` 下可用，但必须在 Tongverse Docker 环境内逐阶段验证关节索引、控制模式和 observation 字段后方可启用。
 
 ## 目录
 
