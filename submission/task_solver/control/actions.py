@@ -62,18 +62,30 @@ _UNEVEN_SUBSTAGES = {SubStage.CROSSING_UNEVEN}
 class ActionFactory:
     """Builds validated Tongverse action dicts from planner decisions.
 
-    For terrain stages the factory delegates to :class:`SinusoidalGait`.
-    For manipulation stages it uses :class:`PosturePrimitive` to produce
-    arm targets and neutral leg targets.  Recovery is handled by
-    :class:`RecoveryPrimitive`.
+    In **safe mode** (default) every decision produces a validated neutral
+    (zero-vector) action regardless of stage or sub-stage.  This is the
+    required baseline until joint indices, control modes, pick semantics,
+    and observation fields are confirmed against the real Docker environment.
+
+    When ``safe_mode=False`` the factory delegates to :class:`SinusoidalGait`,
+    :class:`PosturePrimitive`, and :class:`RecoveryPrimitive`.  Those code
+    paths remain available for experimental branches but MUST NOT run on
+    ``main`` without explicit approval.
     """
 
-    def __init__(self, agent_params: Mapping[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        agent_params: Mapping[str, Any] | None = None,
+        *,
+        safe_mode: bool = True,
+    ) -> None:
         params = agent_params if isinstance(agent_params, Mapping) else {}
         self._arm_count = _joint_count(params, "arm_idx", 14)
         self._leg_count = _joint_count(params, "leg_idx", 12)
         self._head_count = _joint_count(params, "head_idx", 2)
+        self._safe_mode = safe_mode
 
+        # Experimental primitives — initialised but NOT used in safe mode.
         self._gait = SinusoidalGait(
             params=_FLAT_GAIT,
             leg_count=self._leg_count,
@@ -90,6 +102,7 @@ class ActionFactory:
 
         self._step_index: int = 0
         self._dt: float = 0.02  # estimated control period (s)
+        self._in_recovery: bool = False  # tracks recovery entry for reset
 
     # ------------------------------------------------------------------
     # public entry point
@@ -98,7 +111,21 @@ class ActionFactory:
     def for_decision(self, decision: PlanDecision, task_id: str | None) -> dict[str, Any]:
         self._step_index += 1
 
-        if decision.needs_recovery or decision.sub_stage == SubStage.FALL_RECOVERY:
+        # --- safe mode: always neutral ---------------------------------
+        if self._safe_mode:
+            return self._neutral_action(decision, task_id)
+
+        # --- experimental paths (guarded by safe_mode=False) -----------
+
+        # Reset recovery primitive on new recovery entry
+        entering_recovery = decision.needs_recovery or decision.sub_stage == SubStage.FALL_RECOVERY
+        if entering_recovery and not self._in_recovery:
+            self._recovery.reset()
+            self._in_recovery = True
+        elif not entering_recovery:
+            self._in_recovery = False
+
+        if entering_recovery:
             return self._recovery_action()
 
         if decision.stage == Stage.NAVIGATE_TERRAIN:

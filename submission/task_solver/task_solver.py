@@ -19,15 +19,29 @@ class TaskSolver:
     Instantiated once per episode with *task_params* and *agent_params*.
     Each simulation step calls :meth:`next_action` with the current
     observation dict, which returns a validated action dict.
+
+    By default the solver operates in **safe mode** — every action is a
+    validated neutral (zero-vector) dict regardless of planner decisions.
+    Experimental gaits, manipulation, and recovery are gated behind
+    ``safe_mode=False`` and must only be enabled after joint indices,
+    control modes, and observation fields are confirmed against the real
+    Docker environment.
     """
 
-    def __init__(self, task_params: Mapping[str, Any], agent_params: Mapping[str, Any]) -> None:
+    def __init__(
+        self,
+        task_params: Mapping[str, Any],
+        agent_params: Mapping[str, Any],
+        *,
+        safe_mode: bool = True,
+    ) -> None:
         self.task_params = dict(task_params or {})
         self.agent_params = dict(agent_params or {})
+        self._safe_mode = safe_mode
         self._telemetry = Telemetry()
         self._parser = ObservationParser()
         self._planner = LongHorizonPlanner(on_transition=self._telemetry.record_transition)
-        self._actions = ActionFactory(self.agent_params)
+        self._actions = ActionFactory(self.agent_params, safe_mode=safe_mode)
 
     # ------------------------------------------------------------------
     # public properties

@@ -177,7 +177,7 @@ class SinusoidalGait:
         t = self.terrain
         p = self.params
 
-        # Temporarily reduce step length for downhill
+        # Temporarily reduce step length and speed for downhill stability
         saved = p
         reduced = GaitParams(
             frequency=p.frequency * t.slope_speed_factor,
@@ -188,9 +188,10 @@ class SinusoidalGait:
             lateral_swing=p.lateral_swing * 1.2,
             double_support_ratio=p.double_support_ratio * 1.4,
         )
+        self.params = reduced
 
         arm, leg = self.tick(dt)
-        # restore (immutable params — but re-assign to be safe)
+        self.params = saved
         # Apply backward lean to prevent tipping forward
         lean = -t.slope_forward_lean
         for side_start in (0, self._legs_per_side):

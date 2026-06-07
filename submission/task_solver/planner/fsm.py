@@ -72,6 +72,10 @@ _STAGE_DEADLINES: Mapping[Stage, float] = {
 # Maximum retries per failed operation before skipping
 _MAX_RETRIES = 2
 
+# Recovery timing (seconds)
+_RECOVERY_MIN_DURATION = 0.5 / 60.0   # minimum recovery time (min)
+_RECOVERY_TIMEOUT = 10.0 / 60.0        # give up after 10 s (min)
+
 
 class LongHorizonPlanner:
     """Long-horizon finite-state-machine planner.
@@ -94,6 +98,7 @@ class LongHorizonPlanner:
 
         # --- per-stage bookkeeping ---
         self._entry_elapsed: float = 0.0
+        self._sub_stage_entry_elapsed: float = 0.0  # per-sub-stage clock
         self._retry_count: int = 0
         self._part_picked_count: int = 0
         self._last_stage_elapsed: Mapping[Stage, float] = {}
@@ -103,6 +108,7 @@ class LongHorizonPlanner:
 
         # --- recovery state ---
         self._in_recovery: bool = False
+        self._recovery_entry_elapsed: float = 0.0
         self._pre_recovery_sub_stage: SubStage = SubStage.IDLE
 
     # ------------------------------------------------------------------
@@ -177,6 +183,7 @@ class LongHorizonPlanner:
     def _enter_stage(self, target: Stage, snapshot: SceneSnapshot) -> None:
         self._transition(target, f"environment task id is {snapshot.task_id}")
         self._entry_elapsed = snapshot.elapsed_minutes
+        self._sub_stage_entry_elapsed = snapshot.elapsed_minutes
         self._retry_count = 0
         self._in_recovery = False
 
@@ -194,7 +201,11 @@ class LongHorizonPlanner:
     # ------------------------------------------------------------------
 
     def _advance_sub_stage(self, snapshot: SceneSnapshot) -> None:
-        """Advance to the next sub-stage when conditions are met."""
+        """Advance to the next sub-stage when conditions are met.
+
+        Uses **per-sub-stage elapsed time** so that each sub-stage gets its
+        own independent time budget.  Advancing resets the sub-stage clock.
+        """
         chain = _STAGE_CHAINS.get(self._stage)
         if not chain:
             return
@@ -207,12 +218,14 @@ class LongHorizonPlanner:
         # Check if the current sub-stage is complete
         if self._sub_stage_complete(self._sub_stage, snapshot) and idx + 1 < len(chain):
             self._sub_stage = chain[idx + 1]
+            self._sub_stage_entry_elapsed = snapshot.elapsed_minutes
             LOGGER.debug("sub_stage_advance stage=%s sub=%s", self._stage.value, self._sub_stage.value)
 
         # If sort is complete for one part, loop back to scan for next part
         if self._sub_stage == SubStage.SORT_COMPLETE and self._part_picked_count < self._part_target(snapshot):
             self._retry_count = 0
             self._sub_stage = SubStage.SCAN_WORKSPACE
+            self._sub_stage_entry_elapsed = snapshot.elapsed_minutes
             LOGGER.debug("sort_loop part=%d/%d", self._part_picked_count, self._part_target(snapshot))
 
     @staticmethod
@@ -227,11 +240,15 @@ class LongHorizonPlanner:
     def _sub_stage_complete(self, sub: SubStage, snapshot: SceneSnapshot) -> bool:
         """Heuristic per-sub-stage completion check.
 
-        In the absence of reliable simulator state feedback, most sub-stages
-        auto-advance after an estimated time budget.  These estimates MUST be
-        calibrated against real simulator runs once Docker is available.
+        Each sub-stage receives an independent time budget measured from the
+        moment it was entered.  When a sub-stage advances, its clock resets.
+        This prevents the bug where accumulated stage time causes rapid
+        sequential advances across multiple sub-stages in a single tick.
+
+        These budgets MUST be calibrated against real simulator runs once
+        Docker is available.
         """
-        stage_elapsed = snapshot.elapsed_minutes - self._entry_elapsed
+        sub_elapsed = snapshot.elapsed_minutes - self._sub_stage_entry_elapsed
 
         # --- terrain heuristics (time-based, keyed to chain position) ---------
         _TERRAIN_BUDGETS: Mapping[SubStage, float] = {
@@ -277,7 +294,7 @@ class LongHorizonPlanner:
             budgets = _BOX_BUDGETS
 
         budget = budgets.get(sub, 2.0)
-        return stage_elapsed > budget
+        return sub_elapsed > budget
 
     # ------------------------------------------------------------------
     # recovery
@@ -287,25 +304,49 @@ class LongHorizonPlanner:
         LOGGER.warning("fall_detected stage=%s sub=%s elapsed=%.2f",
                        self._stage.value, self._sub_stage.value, snapshot.elapsed_minutes)
         self._in_recovery = True
+        self._recovery_entry_elapsed = snapshot.elapsed_minutes
         self._pre_recovery_sub_stage = self._sub_stage
         self._sub_stage = SubStage.FALL_RECOVERY
 
     def _tick_recovery(self, snapshot: SceneSnapshot) -> PlanDecision:
-        # Recovery is complete when robot is upright again
-        if not snapshot.is_fallen and snapshot.robot_has_ground_contact:
+        """Tick recovery with proper timing guards.
+
+        Recovery requires BOTH:
+        1. Minimum duration elapsed (so the recovery primitive has time to run)
+        2. Robot is upright with ground contact
+
+        Times out after _RECOVERY_TIMEOUT minutes if the robot cannot stand up.
+        Success is checked first — a slow-but-successful recovery is fine.
+        """
+        recovery_elapsed = snapshot.elapsed_minutes - self._recovery_entry_elapsed
+
+        # Check if robot is upright AND minimum duration has passed
+        is_upright = not snapshot.is_fallen and snapshot.robot_has_ground_contact
+        min_duration_met = recovery_elapsed >= _RECOVERY_MIN_DURATION
+
+        if is_upright and min_duration_met:
             self._in_recovery = False
             self._sub_stage = self._pre_recovery_sub_stage
+            self._sub_stage_entry_elapsed = snapshot.elapsed_minutes
             self._retry_count += 1
 
             if self._retry_count > _MAX_RETRIES:
                 self._sub_stage = SubStage.SKIP_CURRENT
                 LOGGER.warning("max_retries_exceeded stage=%s", self._stage.value)
 
-            LOGGER.info("recovery_complete retries=%d resume_sub=%s",
-                        self._retry_count, self._sub_stage.value)
-        else:
-            self._sub_stage = SubStage.FALL_RECOVERY
+            LOGGER.info("recovery_complete retries=%d resume_sub=%s elapsed=%.2f",
+                        self._retry_count, self._sub_stage.value, recovery_elapsed)
+            return self._decision(snapshot)
 
+        # Timeout — give up and mark as failed
+        if recovery_elapsed > _RECOVERY_TIMEOUT:
+            LOGGER.warning("recovery_timeout after %.2f min", recovery_elapsed)
+            self._in_recovery = False
+            self._sub_stage = SubStage.TIMEOUT_ABORT
+            self._transition(Stage.FAILED, f"recovery timeout after {recovery_elapsed:.2f} min")
+            return self._decision(snapshot)
+
+        self._sub_stage = SubStage.FALL_RECOVERY
         return self._decision(snapshot)
 
     # ------------------------------------------------------------------

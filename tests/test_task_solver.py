@@ -5,7 +5,8 @@ from submission.task_solver.task_solver import TaskSolver
 
 
 class TaskSolverTests(unittest.TestCase):
-    def test_solver_returns_valid_action_and_tracks_stage(self) -> None:
+    def test_solver_returns_neutral_action_in_safe_mode(self) -> None:
+        """Safe mode (default): all actions are neutral regardless of stage."""
         solver = TaskSolver(
             task_params={"task_goal": {"type": "A"}},
             agent_params={
@@ -13,9 +14,10 @@ class TaskSolverTests(unittest.TestCase):
                 "leg_idx": list(range(12)),
                 "head_idx": list(range(2)),
             },
+            safe_mode=True,
         )
 
-        action = solver.next_action(
+        action1 = solver.next_action(
             {
                 "extras": {
                     "Current_Task_ID": "TaskTwo",
@@ -26,11 +28,26 @@ class TaskSolverTests(unittest.TestCase):
         )
 
         self.assertEqual(solver.current_stage, Stage.SORT_PARTS)
-        self.assertIn("pick", action)
-        self.assertIsNone(action["pick"])
-        self.assertEqual(len(action["arms"]["joint_values"]), 14)
+        self.assertIn("pick", action1)
+        self.assertIsNone(action1["pick"])
+        self.assertEqual(len(action1["arms"]["joint_values"]), 14)
 
-    def test_solver_produces_gait_for_terrain(self) -> None:
+        # In safe mode, terrain action must also be neutral
+        action2 = solver.next_action(
+            {
+                "extras": {
+                    "Current_Task_ID": "TaskOne",
+                    "time(minutes)": 0.0,
+                    "info": "",
+                }
+            }
+        )
+        # All joint values should be zero in safe mode
+        self.assertTrue(all(v == 0.0 for v in action2["legs"]["joint_values"]),
+                        "Safe mode must produce zero leg values")
+
+    def test_unsafe_mode_produces_gait_for_terrain(self) -> None:
+        """Unsafe mode: terrain stages produce non-zero gait values."""
         solver = TaskSolver(
             task_params={},
             agent_params={
@@ -38,6 +55,7 @@ class TaskSolverTests(unittest.TestCase):
                 "leg_idx": list(range(12)),
                 "head_idx": list(range(2)),
             },
+            safe_mode=False,
         )
 
         action = solver.next_action(
@@ -52,10 +70,10 @@ class TaskSolverTests(unittest.TestCase):
 
         self.assertEqual(solver.current_stage, Stage.NAVIGATE_TERRAIN)
         self.assertEqual(len(action["legs"]["joint_values"]), 12)
-        # Gait should produce non-zero leg values
+        # Gait should produce non-zero leg values in unsafe mode
         self.assertTrue(
             any(v != 0.0 for v in action["legs"]["joint_values"]),
-            "Terrain gait should drive leg joints",
+            "Unsafe mode terrain gait should drive leg joints",
         )
 
     def test_telemetry_tracks_actions(self) -> None:
