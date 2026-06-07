@@ -200,6 +200,7 @@ class PlanDecision:
     retry_count: int = 0
     part_picked_count: int = 0
     part_target_count: int = 3
+    failure_reason: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -218,3 +219,98 @@ class TelemetryRecord:
     pick_command: str | None
     fall_detected: bool
     extra: Mapping[str, Any] = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Episode context — merged from task_params + observation
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class EpisodeContext:
+    """Normalized per-episode context from ``task_params`` and first observation.
+
+    This is the single source of truth for the planner.  Fields that cannot
+    be determined from the available data default to safe values.
+    """
+
+    task_id: str = ""
+    target_part_type: str = ""   # "A", "B", "C", etc.
+    target_part_count: int = 3
+    max_episode_minutes: float = 20.0
+
+    @classmethod
+    def from_params(
+        cls,
+        task_params: Mapping[str, Any],
+        task_id: str | None = None,
+    ) -> EpisodeContext:
+        """Build context from the launcher-provided *task_params* dict."""
+        params = dict(task_params) if isinstance(task_params, Mapping) else {}
+        goal = params.get("task_goal") if isinstance(params.get("task_goal"), Mapping) else {}
+        return cls(
+            task_id=task_id or "",
+            target_part_type=str(goal.get("type", "")),
+            target_part_count=_safe_int(goal.get("count"), 3),
+            max_episode_minutes=_safe_float(params.get("max_episode_minutes"), 20.0),
+        )
+
+    def merge_observation(self, task_id: str | None, task_goal: Mapping[str, Any]) -> EpisodeContext:
+        """Return a new context enriched with per-frame observation fields."""
+        new_task_id = task_id or self.task_id
+        goal = dict(task_goal) if isinstance(task_goal, Mapping) else {}
+        return EpisodeContext(
+            task_id=new_task_id,
+            target_part_type=str(goal.get("type", self.target_part_type)) or self.target_part_type,
+            target_part_count=_safe_int(goal.get("count"), self.target_part_count),
+            max_episode_minutes=self.max_episode_minutes,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Structured completion / failure
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CompletionStatus:
+    """Structured result of a sub-stage completion check.
+
+    This replaces a bare boolean so that each completion (or non-completion)
+    carries a human-readable reason that can be logged and audited.
+    """
+
+    is_complete: bool
+    reason: str = ""
+    is_timeout: bool = False
+
+    @classmethod
+    def done(cls, reason: str) -> CompletionStatus:
+        return cls(is_complete=True, reason=reason)
+
+    @classmethod
+    def not_yet(cls, reason: str = "") -> CompletionStatus:
+        return cls(is_complete=False, reason=reason)
+
+    @classmethod
+    def timeout(cls, reason: str) -> CompletionStatus:
+        return cls(is_complete=True, reason=reason, is_timeout=True)
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+
+def _safe_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default

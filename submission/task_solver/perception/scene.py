@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from ..models import SceneSnapshot
+from ..models import EpisodeContext, SceneSnapshot
 
 
 def _mapping(value: Any) -> Mapping[str, Any]:
@@ -56,9 +56,18 @@ class ObservationParser:
     Every field that is missing or unreadable is replaced with a well-defined
     default so that downstream planners and controllers never crash on
     incomplete observations.
+
+    When *episode_context* is provided, task-level fields (part type, count)
+    are merged into the snapshot's ``task_goal`` so the planner has a single
+    source of truth regardless of whether the launcher communicates targets
+    through ``task_params`` or per-frame observation.
     """
 
-    def parse(self, obs: Mapping[str, Any] | None) -> SceneSnapshot:
+    def parse(
+        self,
+        obs: Mapping[str, Any] | None,
+        episode_context: EpisodeContext | None = None,
+    ) -> SceneSnapshot:
         observation = _mapping(obs)
         extras = _mapping(observation.get("extras"))
         robot = _mapping(observation.get("Kuavo"))
@@ -70,6 +79,16 @@ class ObservationParser:
         elapsed = self._parse_elapsed(extras)
         task_id = self._parse_task_id(extras)
         task_goal = _mapping(extras.get("task_goal"))
+
+        # Merge episode-level params into task_goal so the planner sees them
+        # even when the environment only delivers them via task_params.
+        if episode_context is not None:
+            merged = dict(task_goal)
+            if not merged.get("type") and episode_context.target_part_type:
+                merged["type"] = episode_context.target_part_type
+            if not merged.get("count") and episode_context.target_part_count:
+                merged["count"] = episode_context.target_part_count
+            task_goal = merged
 
         return SceneSnapshot(
             task_id=task_id,

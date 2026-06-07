@@ -5,7 +5,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from .control.actions import ActionFactory
-from .models import Stage
+from .models import EpisodeContext, Stage
 from .perception.scene import ObservationParser
 from .planner.fsm import LongHorizonPlanner
 from .telemetry import Telemetry
@@ -38,9 +38,16 @@ class TaskSolver:
         self.task_params = dict(task_params or {})
         self.agent_params = dict(agent_params or {})
         self._safe_mode = safe_mode
+
+        # Build episode context from launcher-provided task_params
+        self._episode_context = EpisodeContext.from_params(self.task_params)
+
         self._telemetry = Telemetry()
         self._parser = ObservationParser()
-        self._planner = LongHorizonPlanner(on_transition=self._telemetry.record_transition)
+        self._planner = LongHorizonPlanner(
+            on_transition=self._telemetry.record_transition,
+            episode_context=self._episode_context,
+        )
         self._actions = ActionFactory(self.agent_params, safe_mode=safe_mode)
 
     # ------------------------------------------------------------------
@@ -65,7 +72,7 @@ class TaskSolver:
 
     def next_action(self, obs: dict) -> dict:
         try:
-            snapshot = self._parser.parse(obs)
+            snapshot = self._parser.parse(obs, episode_context=self._episode_context)
         except Exception:
             LOGGER.exception("observation parse failed")
             self._telemetry.record_error("parse", "observation parse failure", {"obs_keys": list(obs) if isinstance(obs, dict) else []})

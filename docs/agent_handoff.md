@@ -4,6 +4,67 @@
 
 ---
 
+## Handoff 2026-06-07 - P0-B FSM Fixes
+
+### Implemented By
+
+Claude Code
+
+### Date, Branch And Commit
+
+2026-06-07, `dev`, (pending)
+
+### Related Issue And PR
+
+P0-B: 状态机修复 — episode context + 结构化完成事件 + 表驱动测试
+
+### Changed Files
+
+- `submission/task_solver/models.py` — 新增 `EpisodeContext`, `CompletionStatus`, `PlanDecision.failure_reason`
+- `submission/task_solver/perception/scene.py` — `ObservationParser.parse()` 接受 `EpisodeContext`，自动合并 task_goal
+- `submission/task_solver/planner/fsm.py` — 完全重写接受 `EpisodeContext`，结构化完成检查 `_check_completion`，观测驱动完成 `_observation_complete`，超时和失败原因传播
+- `submission/task_solver/task_solver.py` — `TaskSolver` 构建 `EpisodeContext` 并传给 parser 和 planner
+- `tests/test_fsm.py` — 新增 12 个测试类/方法，覆盖表驱动推进、观测驱动完成、重复跌倒、任务切换、超时传播、EpisodeContext 合并
+
+### Summary
+
+- `EpisodeContext` 合并 `task_params` 和 observation：规划器统一从 context 获取分拣目标类型和数量
+- `CompletionStatus` 替代布尔完成检查：每次推进/失败携带人类可读原因
+- 观测驱动完成：`VERIFY_GRASP`（检测到 holding）和 `RELEASE_PART`（检测到 released）通过 observation 判断完成
+- 时间预算作为回退：当没有观测条件时使用独立子阶段时间预算
+- 子阶段超时保护：`_SUB_STAGE_TIMEOUT` 防止卡住
+- `PlanDecision.failure_reason` 传播失败原因到遥测
+- 表驱动测试：48 个测试覆盖正常链推进、重复恢复、任务切换、超时传播
+
+### Test Result
+
+```bash
+python3 -m unittest discover -s tests -v
+python3 scripts/validate_workspace.py
+```
+
+- 单元测试：48 个通过 (0 failures)
+- 工作区校验：通过
+- 仿真：未运行
+
+### Known Risks
+
+- 观测驱动完成的条件基于当前对 observation 字段的猜测；Docker 采样后需更新 `_observation_complete`
+- 地形子阶段仍使用时间预算完成（无观测条件可用）
+- 所有子阶段时间预算未经仿真校准
+
+### Codex Review
+
+Verdict: Pending
+
+Blocking issues resolved:
+- ✅ Review #5 `[Major]` task_params 被保存但未参与感知或规划 → `EpisodeContext` 现已传播到 planner
+
+Continuing issues:
+- Review #4 (TaskTwo/TaskThree mapping) → 待 P0-C Docker 采样
+
+---
+
 ## Handoff 2026-06-07 - P0-A Safe Neutral Baseline
 
 ### Implemented By

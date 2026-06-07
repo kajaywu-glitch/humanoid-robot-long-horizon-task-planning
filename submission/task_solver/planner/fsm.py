@@ -5,6 +5,8 @@ from collections.abc import Callable
 from typing import Any, Mapping
 
 from ..models import (
+    CompletionStatus,
+    EpisodeContext,
     PlanDecision,
     SceneSnapshot,
     Stage,
@@ -69,6 +71,44 @@ _STAGE_DEADLINES: Mapping[Stage, float] = {
     Stage.MOVE_BOX_TO_SHELF: 4.0,
 }
 
+# Per-sub-stage time budgets (minutes) — estimated completion time.
+# These are fallback values; the planner prefers observation-driven completion.
+_TERRAIN_BUDGETS: Mapping[SubStage, float] = {
+    SubStage.TERRAIN_START: 0.1,
+    SubStage.APPROACH_STAIRS: 0.3,
+    SubStage.CLIMBING_STAIRS: 1.0,
+    SubStage.POST_STAIRS_TRANSITION: 0.3,
+    SubStage.APPROACH_DOWNHILL: 0.3,
+    SubStage.DESCENDING_SLOPE: 0.8,
+    SubStage.POST_SLOPE_TRANSITION: 0.3,
+    SubStage.CROSSING_UNEVEN: 1.0,
+}
+
+_SORT_BUDGETS: Mapping[SubStage, float] = {
+    SubStage.SORT_START: 0.1,
+    SubStage.SCAN_WORKSPACE: 0.5,
+    SubStage.IDENTIFY_TARGET: 0.3,
+    SubStage.APPROACH_PART: 0.5,
+    SubStage.GRASP_PART: 0.5,
+    SubStage.VERIFY_GRASP: 0.2,
+    SubStage.MOVE_TO_BOX: 0.5,
+    SubStage.RELEASE_PART: 0.3,
+}
+
+_BOX_BUDGETS: Mapping[SubStage, float] = {
+    SubStage.BOX_START: 0.1,
+    SubStage.APPROACH_BOX: 0.5,
+    SubStage.LIFT_BOX: 0.5,
+    SubStage.NAVIGATE_TO_SHELF: 1.0,
+    SubStage.ALIGN_SHELF: 0.5,
+    SubStage.PLACE_BOX: 0.5,
+    SubStage.STABILIZE: 0.3,
+}
+
+# Per-sub-stage timeout (minutes) — maximum time before skipping.
+# Significantly longer than budgets; triggers skip, not completion.
+_SUB_STAGE_TIMEOUT = 5.0  # generous default per sub-stage
+
 # Maximum retries per failed operation before skipping
 _MAX_RETRIES = 2
 
@@ -83,6 +123,10 @@ class LongHorizonPlanner:
     On each ``tick()`` the planner inspects the snapshot, advances sub-stages
     within the current top-level stage, and emits a :class:`PlanDecision` that
     encodes both the strategic stage and the tactical sub-stage.
+
+    When an *episode_context* is provided it becomes the single source of
+    truth for task-level parameters (part type, count) that may arrive via
+    ``task_params`` rather than per-frame observation.
     """
 
     _TASK_STAGE: Mapping[str, Stage] = {
@@ -91,10 +135,15 @@ class LongHorizonPlanner:
         "TaskThree": Stage.MOVE_BOX_TO_SHELF,
     }
 
-    def __init__(self, on_transition: TransitionListener | None = None) -> None:
+    def __init__(
+        self,
+        on_transition: TransitionListener | None = None,
+        episode_context: EpisodeContext | None = None,
+    ) -> None:
         self._stage: Stage = Stage.INIT
         self._sub_stage: SubStage = SubStage.IDLE
         self._on_transition = on_transition
+        self._context = episode_context or EpisodeContext()
 
         # --- per-stage bookkeeping ---
         self._entry_elapsed: float = 0.0
@@ -102,6 +151,7 @@ class LongHorizonPlanner:
         self._retry_count: int = 0
         self._part_picked_count: int = 0
         self._last_stage_elapsed: Mapping[Stage, float] = {}
+        self._last_failure_reason: str = ""
 
         # --- terrain inference ---
         self._terrain: TerrainType = TerrainType.UNKNOWN
@@ -131,11 +181,20 @@ class LongHorizonPlanner:
     def part_picked_count(self) -> int:
         return self._part_picked_count
 
+    @property
+    def episode_context(self) -> EpisodeContext:
+        return self._context
+
     # ------------------------------------------------------------------
     # main tick
     # ------------------------------------------------------------------
 
     def tick(self, snapshot: SceneSnapshot) -> PlanDecision:
+        # Update context with per-frame observation task info
+        self._context = self._context.merge_observation(
+            snapshot.task_id, snapshot.task_goal
+        )
+
         info_lower = snapshot.info.lower()
 
         # -- terminal guards ---------------------------------------------------
@@ -147,6 +206,7 @@ class LongHorizonPlanner:
             return self._decision(snapshot)
 
         if "time limit reached" in info_lower or "fall detected" in info_lower:
+            self._last_failure_reason = snapshot.info
             self._transition(Stage.FAILED, snapshot.info)
             return self._decision(snapshot)
 
@@ -164,12 +224,14 @@ class LongHorizonPlanner:
         if self._in_recovery:
             return self._tick_recovery(snapshot)
 
-        # -- timeout check -----------------------------------------------------
+        # -- stage-level timeout -----------------------------------------------
         stage_elapsed = snapshot.elapsed_minutes - self._entry_elapsed
         deadline = _STAGE_DEADLINES.get(self._stage)
         if deadline is not None and stage_elapsed > deadline:
+            self._last_failure_reason = f"stage timeout after {stage_elapsed:.1f} min"
             self._sub_stage = SubStage.TIMEOUT_ABORT
-            self._transition(Stage.FAILED, f"stage timeout after {stage_elapsed:.1f} min")
+            self._transition(Stage.FAILED, self._last_failure_reason)
+            return self._decision(snapshot)
 
         # -- sub-stage advancement ---------------------------------------------
         self._advance_sub_stage(snapshot)
@@ -186,6 +248,7 @@ class LongHorizonPlanner:
         self._sub_stage_entry_elapsed = snapshot.elapsed_minutes
         self._retry_count = 0
         self._in_recovery = False
+        self._last_failure_reason = ""
 
         chain = _STAGE_CHAINS.get(target, ())
         self._sub_stage = chain[0] if chain else SubStage.IDLE
@@ -203,8 +266,9 @@ class LongHorizonPlanner:
     def _advance_sub_stage(self, snapshot: SceneSnapshot) -> None:
         """Advance to the next sub-stage when conditions are met.
 
-        Uses **per-sub-stage elapsed time** so that each sub-stage gets its
-        own independent time budget.  Advancing resets the sub-stage clock.
+        Completion is determined by :meth:`_check_completion` which returns a
+        structured :class:`CompletionStatus`.  Each sub-stage uses a per-stage
+        clock that resets on advance.
         """
         chain = _STAGE_CHAINS.get(self._stage)
         if not chain:
@@ -215,86 +279,115 @@ class LongHorizonPlanner:
         except ValueError:
             return
 
-        # Check if the current sub-stage is complete
-        if self._sub_stage_complete(self._sub_stage, snapshot) and idx + 1 < len(chain):
+        status = self._check_completion(self._sub_stage, snapshot)
+
+        if status.is_complete and idx + 1 < len(chain):
+            if status.is_timeout:
+                LOGGER.warning(
+                    "sub_stage_timeout stage=%s sub=%s reason=%s",
+                    self._stage.value, self._sub_stage.value, status.reason,
+                )
+                # On timeout, advance but record the reason
+                self._last_failure_reason = status.reason
+            else:
+                self._last_failure_reason = ""
+
             self._sub_stage = chain[idx + 1]
             self._sub_stage_entry_elapsed = snapshot.elapsed_minutes
-            LOGGER.debug("sub_stage_advance stage=%s sub=%s", self._stage.value, self._sub_stage.value)
+            LOGGER.debug(
+                "sub_stage_advance stage=%s sub=%s reason=%s",
+                self._stage.value, self._sub_stage.value, status.reason,
+            )
 
         # If sort is complete for one part, loop back to scan for next part
-        if self._sub_stage == SubStage.SORT_COMPLETE and self._part_picked_count < self._part_target(snapshot):
+        if self._sub_stage == SubStage.SORT_COMPLETE and self._part_picked_count < self._part_target():
             self._retry_count = 0
             self._sub_stage = SubStage.SCAN_WORKSPACE
             self._sub_stage_entry_elapsed = snapshot.elapsed_minutes
-            LOGGER.debug("sort_loop part=%d/%d", self._part_picked_count, self._part_target(snapshot))
+            LOGGER.debug("sort_loop part=%d/%d", self._part_picked_count, self._part_target())
 
-    @staticmethod
-    def _part_target(snapshot: SceneSnapshot) -> int:
-        goal = snapshot.task_goal
-        count = goal.get("count") if isinstance(goal, Mapping) else None
-        try:
-            return int(count) if count is not None else 3
-        except (TypeError, ValueError):
-            return 3
+    def _part_target(self) -> int:
+        return self._context.target_part_count
 
-    def _sub_stage_complete(self, sub: SubStage, snapshot: SceneSnapshot) -> bool:
-        """Heuristic per-sub-stage completion check.
+    def _check_completion(self, sub: SubStage, snapshot: SceneSnapshot) -> CompletionStatus:
+        """Structured completion check for *sub*.
 
-        Each sub-stage receives an independent time budget measured from the
-        moment it was entered.  When a sub-stage advances, its clock resets.
-        This prevents the bug where accumulated stage time causes rapid
-        sequential advances across multiple sub-stages in a single tick.
+        Checks in priority order:
+        1. **Observation-driven** — concrete evidence from the scene.
+        2. **Time budget** — estimated time elapsed (fallback).
+        3. **Timeout** — maximum allowed time exceeded.
 
-        These budgets MUST be calibrated against real simulator runs once
-        Docker is available.
+        All reasons are logged for auditability.
         """
         sub_elapsed = snapshot.elapsed_minutes - self._sub_stage_entry_elapsed
 
-        # --- terrain heuristics (time-based, keyed to chain position) ---------
-        _TERRAIN_BUDGETS: Mapping[SubStage, float] = {
-            SubStage.TERRAIN_START: 0.1,
-            SubStage.APPROACH_STAIRS: 0.3,
-            SubStage.CLIMBING_STAIRS: 1.0,
-            SubStage.POST_STAIRS_TRANSITION: 0.3,
-            SubStage.APPROACH_DOWNHILL: 0.3,
-            SubStage.DESCENDING_SLOPE: 0.8,
-            SubStage.POST_SLOPE_TRANSITION: 0.3,
-            SubStage.CROSSING_UNEVEN: 1.0,
-        }
+        # --- observation-driven checks ----------------------------------------
+        obs_status = self._observation_complete(sub, snapshot)
+        if obs_status is not None:
+            return obs_status
 
-        # --- sort heuristics ------------------------------------------------
-        _SORT_BUDGETS: Mapping[SubStage, float] = {
-            SubStage.SORT_START: 0.1,
-            SubStage.SCAN_WORKSPACE: 0.5,
-            SubStage.IDENTIFY_TARGET: 0.3,
-            SubStage.APPROACH_PART: 0.5,
-            SubStage.GRASP_PART: 0.5,
-            SubStage.VERIFY_GRASP: 0.2,
-            SubStage.MOVE_TO_BOX: 0.5,
-            SubStage.RELEASE_PART: 0.3,
-        }
+        # --- time budget (fallback) -------------------------------------------
+        budget = self._budget_for(sub)
+        if sub_elapsed > budget:
+            return CompletionStatus.done(
+                f"time_budget: {sub_elapsed:.3f} min > {budget:.3f} min"
+            )
 
-        # --- box heuristics --------------------------------------------------
-        _BOX_BUDGETS: Mapping[SubStage, float] = {
-            SubStage.BOX_START: 0.1,
-            SubStage.APPROACH_BOX: 0.5,
-            SubStage.LIFT_BOX: 0.5,
-            SubStage.NAVIGATE_TO_SHELF: 1.0,
-            SubStage.ALIGN_SHELF: 0.5,
-            SubStage.PLACE_BOX: 0.5,
-            SubStage.STABILIZE: 0.3,
-        }
+        # --- sub-stage timeout (skip, don't silently succeed) -----------------
+        if sub_elapsed > _SUB_STAGE_TIMEOUT:
+            return CompletionStatus.timeout(
+                f"sub_stage_timeout: {sub_elapsed:.3f} min > {_SUB_STAGE_TIMEOUT:.3f} min"
+            )
 
-        budgets: Mapping[SubStage, float] = {}
-        if self._stage == Stage.NAVIGATE_TERRAIN:
-            budgets = _TERRAIN_BUDGETS
-        elif self._stage == Stage.SORT_PARTS:
-            budgets = _SORT_BUDGETS
-        elif self._stage == Stage.MOVE_BOX_TO_SHELF:
-            budgets = _BOX_BUDGETS
+        return CompletionStatus.not_yet(
+            f"waiting: {sub_elapsed:.3f}/{budget:.3f} min"
+        )
 
-        budget = budgets.get(sub, 2.0)
-        return sub_elapsed > budget
+    # ------------------------------------------------------------------
+    # observation-driven completion (extensible per sub-stage)
+    # ------------------------------------------------------------------
+
+    def _observation_complete(
+        self, sub: SubStage, snapshot: SceneSnapshot
+    ) -> CompletionStatus | None:
+        """Return a CompletionStatus if *sub* can be decided from observation.
+
+        Returns ``None`` when there is no observation-based check for this
+        sub-stage — the caller falls back to time-based heuristics.
+
+        This method is designed to grow as Docker sampling reveals which
+        observation fields actually signal completion.
+        """
+        # --- grasp verification ------------------------------------------------
+        if sub == SubStage.VERIFY_GRASP:
+            if snapshot.is_holding_object:
+                return CompletionStatus.done("observation: holding object confirmed")
+            return None  # fall back to time
+
+        # --- release verification ----------------------------------------------
+        if sub == SubStage.RELEASE_PART:
+            if not snapshot.is_holding_object:
+                return CompletionStatus.done("observation: released object")
+            return None
+
+        # --- terrain detection from IMU ----------------------------------------
+        if sub == SubStage.TERRAIN_COMPLETE:
+            return CompletionStatus.done("observation: chain exhausted")
+
+        # No observation-based check for this sub-stage yet
+        return None
+
+    # ------------------------------------------------------------------
+    # budget lookup
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _budget_for(sub: SubStage) -> float:
+        """Return the estimated time budget for *sub* regardless of stage."""
+        for budgets in (_TERRAIN_BUDGETS, _SORT_BUDGETS, _BOX_BUDGETS):
+            if sub in budgets:
+                return budgets[sub]
+        return 2.0
 
     # ------------------------------------------------------------------
     # recovery
@@ -315,7 +408,7 @@ class LongHorizonPlanner:
         1. Minimum duration elapsed (so the recovery primitive has time to run)
         2. Robot is upright with ground contact
 
-        Times out after _RECOVERY_TIMEOUT minutes if the robot cannot stand up.
+        Times out after _RECOVERY_TIMEOUT minutes.
         Success is checked first — a slow-but-successful recovery is fine.
         """
         recovery_elapsed = snapshot.elapsed_minutes - self._recovery_entry_elapsed
@@ -332,6 +425,7 @@ class LongHorizonPlanner:
 
             if self._retry_count > _MAX_RETRIES:
                 self._sub_stage = SubStage.SKIP_CURRENT
+                self._last_failure_reason = f"max retries ({_MAX_RETRIES}) exceeded"
                 LOGGER.warning("max_retries_exceeded stage=%s", self._stage.value)
 
             LOGGER.info("recovery_complete retries=%d resume_sub=%s elapsed=%.2f",
@@ -340,10 +434,11 @@ class LongHorizonPlanner:
 
         # Timeout — give up and mark as failed
         if recovery_elapsed > _RECOVERY_TIMEOUT:
-            LOGGER.warning("recovery_timeout after %.2f min", recovery_elapsed)
+            self._last_failure_reason = f"recovery timeout after {recovery_elapsed:.2f} min"
+            LOGGER.warning(self._last_failure_reason)
             self._in_recovery = False
             self._sub_stage = SubStage.TIMEOUT_ABORT
-            self._transition(Stage.FAILED, f"recovery timeout after {recovery_elapsed:.2f} min")
+            self._transition(Stage.FAILED, self._last_failure_reason)
             return self._decision(snapshot)
 
         self._sub_stage = SubStage.FALL_RECOVERY
@@ -362,7 +457,8 @@ class LongHorizonPlanner:
             needs_recovery=self._in_recovery,
             retry_count=self._retry_count,
             part_picked_count=self._part_picked_count,
-            part_target_count=self._part_target(snapshot),
+            part_target_count=self._part_target(),
+            failure_reason=self._last_failure_reason,
         )
 
     def _transition(self, target: Stage, reason: str) -> None:
